@@ -259,7 +259,7 @@ export class QueueService {
     if (currentLoad >= staff.dailyCapacity) {
       return {
         canAssign: false,
-        reason: `Staff at capacity: ${currentLoad}/${staff.dailyCapacity}`,
+        reason: `${staff.name} already has ${staff.dailyCapacity} appointments today.`,
       };
     }
 
@@ -271,7 +271,7 @@ export class QueueService {
     );
 
     if (hasConflict) {
-      return { canAssign: false, reason: 'Time conflict' };
+      return { canAssign: false, reason: 'This staff member already has an appointment at this time.' };
     }
 
     return { canAssign: true };
@@ -279,8 +279,12 @@ export class QueueService {
 
   /* -------------------- REORDER QUEUE -------------------- */
   private async reorderQueue() {
+    // Order by appointment time, not by when the entry was added
     const queueEntries = await this.db.query`
-      SELECT id FROM queue_entries ORDER BY added_at ASC
+      SELECT q.id
+      FROM queue_entries q
+      JOIN appointments a ON q.appointment_id = a.id
+      ORDER BY a.appointment_date ASC, a.appointment_time ASC
     `;
 
     for (let i = 0; i < queueEntries.length; i++) {

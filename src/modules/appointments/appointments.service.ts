@@ -326,8 +326,12 @@ export class AppointmentsService {
 
   /* -------------------- HELPER: REORDER QUEUE -------------------- */
   private async reorderQueue() {
+    // Order by appointment time, not by when the entry was added
     const queueEntries = await this.db.query`
-      SELECT id FROM queue_entries ORDER BY added_at ASC
+      SELECT q.id
+      FROM queue_entries q
+      JOIN appointments a ON q.appointment_id = a.id
+      ORDER BY a.appointment_date ASC, a.appointment_time ASC
     `;
 
     for (let i = 0; i < queueEntries.length; i++) {

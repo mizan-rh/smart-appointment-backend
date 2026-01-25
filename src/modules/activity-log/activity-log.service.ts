@@ -147,6 +147,7 @@ export class ActivityLogService {
                 }
                 : undefined,
             timestamp: log.created_at || log.createdAt,
+            createdAt: log.created_at || log.createdAt,
             timeAgo,
         };
     }

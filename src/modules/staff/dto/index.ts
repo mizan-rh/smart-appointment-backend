@@ -6,7 +6,7 @@ import { z } from 'zod';
 export const CreateStaffSchema = z.object({
     name: z.string().min(1, 'Name is required'),
     serviceType: z.string().min(1, 'Service type is required'),
-    dailyCapacity: z.number().int().min(1).max(20).default(5),
+    dailyCapacity: z.number().int().min(1).max(5).default(5),
     status: z.nativeEnum(StaffStatus).default(StaffStatus.AVAILABLE),
 });
 
@@ -16,7 +16,7 @@ export class CreateStaffDto extends createZodDto(CreateStaffSchema) { }
 export const UpdateStaffSchema = z.object({
     name: z.string().min(1).optional(),
     serviceType: z.string().min(1).optional(),
-    dailyCapacity: z.number().int().min(1).max(20).optional(),
+    dailyCapacity: z.number().int().min(1).max(5).optional(),
     status: z.nativeEnum(StaffStatus).optional(),
 });
 

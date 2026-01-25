@@ -1,13 +1,12 @@
-import { z } from 'zod';
 import { createZodDto } from 'nestjs-zod';
+import { z } from 'zod';
 
 // Assign From Queue DTO
 export const AssignFromQueueSchema = z.object({
-  queueEntryId: z.string().uuid('Invalid queue entry ID'),
   staffId: z.string().uuid('Invalid staff ID'),
 });
 
-export class AssignFromQueueDto extends createZodDto(AssignFromQueueSchema) {}
+export class AssignFromQueueDto extends createZodDto(AssignFromQueueSchema) { }
 
 // Queue Entry Response
 export class QueueEntryResponseDto {
