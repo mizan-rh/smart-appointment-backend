@@ -133,8 +133,8 @@ export class AuthController {
   private setRefreshTokenCookie(response: Response, refreshToken: string): void {
     const isProduction = this.configService.get<string>('NODE_ENV') === 'production';
     const domain = this.configService.get<string>('COOKIE_DOMAIN');
-    const secure = this.configService.get<boolean>('COOKIE_SECURE') || isProduction;
-    const sameSite = this.configService.get<'lax' | 'strict' | 'none'>('COOKIE_SAME_SITE');
+    const secure = this.configService.get('COOKIE_SECURE') === 'true' || isProduction;
+    const sameSite = this.configService.get<'lax' | 'strict' | 'none'>('COOKIE_SAME_SITE') || 'lax';
 
     response.cookie('refreshToken', refreshToken, {
       httpOnly: true,

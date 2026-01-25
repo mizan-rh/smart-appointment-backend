@@ -1,13 +1,14 @@
-import { Module, Global, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { Global, Module, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { DatabaseService } from './database.service';
 import { PrismaService } from './prisma.service';
 
 @Global()
 @Module({
-  providers: [PrismaService],
-  exports: [PrismaService],
+  providers: [PrismaService, DatabaseService],
+  exports: [PrismaService, DatabaseService],
 })
 export class DatabaseModule implements OnModuleInit, OnModuleDestroy {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(private readonly prisma: PrismaService) { }
 
   async onModuleInit() {
     await this.prisma.$connect();

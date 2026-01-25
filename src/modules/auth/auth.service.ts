@@ -1,14 +1,16 @@
 import {
-  Injectable,
-  UnauthorizedException,
   ConflictException,
+  Injectable,
   Logger,
+  UnauthorizedException,
 } from '@nestjs/common';
-import { JwtService, JwtSignOptions } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
+import { JwtService, JwtSignOptions } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
+import { randomUUID } from 'crypto';
+import { DatabaseService } from '../../database/database.service';
 import { PrismaService } from '../../database/prisma.service';
-import { SignupDto, LoginDto, AuthResponseDto } from './dto';
+import { AuthResponseDto, LoginDto, SignupDto } from './dto';
 
 @Injectable()
 export class AuthService {
@@ -16,30 +18,28 @@ export class AuthService {
 
   constructor(
     private prisma: PrismaService,
+    private db: DatabaseService,
     private jwtService: JwtService,
     private configService: ConfigService,
-  ) {}
+  ) { }
 
   /* -------------------- SIGNUP -------------------- */
   async signup(dto: SignupDto): Promise<AuthResponseDto> {
-    const existingUser = await this.prisma.user.findUnique({
-      where: { email: dto.email },
-    });
+    const existingUsers = await this.db.query`
+      SELECT * FROM users WHERE email = ${dto.email}
+    `;
 
-    if (existingUser) {
+    if (existingUsers.length > 0) {
       throw new ConflictException('Email already registered');
     }
 
     const hashedPassword = await bcrypt.hash(dto.password, 10);
 
-    const user = await this.prisma.user.create({
-      data: {
-        email: dto.email,
-        password: hashedPassword,
-        firstName: dto.firstName,
-        lastName: dto.lastName,
-      },
-    });
+    const [user] = await this.db.query`
+      INSERT INTO users (id, email, password, first_name, last_name, updated_at)
+      VALUES (${randomUUID()}, ${dto.email}, ${hashedPassword}, ${dto.firstName}, ${dto.lastName}, NOW())
+      RETURNING *
+    `;
 
     const { accessToken, refreshToken } = await this.generateTokens(user.id);
     await this.storeRefreshToken(user.id, refreshToken);
@@ -48,6 +48,7 @@ export class AuthService {
 
     return {
       accessToken,
+      refreshToken,
       user: this.mapUserToResponse(user),
     };
   }
@@ -67,15 +68,16 @@ export class AuthService {
 
     return {
       accessToken,
+      refreshToken,
       user: this.mapUserToResponse(user),
     };
   }
 
   /* -------------------- VALIDATE USER -------------------- */
   async validateUser(email: string, password: string) {
-    const user = await this.prisma.user.findUnique({
-      where: { email },
-    });
+    const [user] = await this.db.query`
+      SELECT * FROM users WHERE email = ${email}
+    `;
 
     if (!user) return null;
 
@@ -90,23 +92,22 @@ export class AuthService {
     userId: string,
     refreshToken: string,
   ): Promise<{ accessToken: string }> {
-    const storedToken = await this.prisma.refreshToken.findUnique({
-      where: { token: refreshToken },
-      include: { user: true },
-    });
+    const [storedToken] = await this.db.query`
+      SELECT * FROM refresh_tokens WHERE token = ${refreshToken}
+    `;
 
     if (
       !storedToken ||
-      storedToken.isRevoked ||
-      storedToken.userId !== userId
+      storedToken.is_revoked ||
+      storedToken.user_id !== userId
     ) {
       throw new UnauthorizedException('Invalid refresh token');
     }
 
-    if (new Date() > storedToken.expiresAt) {
-      await this.prisma.refreshToken.delete({
-        where: { id: storedToken.id },
-      });
+    if (new Date() > storedToken.expires_at) {
+      await this.db.query`
+        DELETE FROM refresh_tokens WHERE id = ${storedToken.id}
+      `;
       throw new UnauthorizedException('Refresh token expired');
     }
 
@@ -116,19 +117,21 @@ export class AuthService {
 
   /* -------------------- LOGOUT -------------------- */
   async logout(userId: string, refreshToken: string): Promise<void> {
-    await this.prisma.refreshToken.updateMany({
-      where: { userId, token: refreshToken },
-      data: { isRevoked: true },
-    });
+    await this.db.query`
+      UPDATE refresh_tokens 
+      SET is_revoked = true 
+      WHERE user_id = ${userId} AND token = ${refreshToken}
+    `;
 
     this.logger.log(`User logged out: ${userId}`);
   }
 
   async revokeAllTokens(userId: string): Promise<void> {
-    await this.prisma.refreshToken.updateMany({
-      where: { userId },
-      data: { isRevoked: true },
-    });
+    await this.db.query`
+      UPDATE refresh_tokens 
+      SET is_revoked = true 
+      WHERE user_id = ${userId}
+    `;
   }
 
   /* -------------------- TOKEN GENERATION -------------------- */
@@ -166,13 +169,10 @@ export class AuthService {
     );
     const expiresAt = this.calculateExpiration(expiresIn);
 
-    await this.prisma.refreshToken.create({
-      data: {
-        token,
-        userId,
-        expiresAt,
-      },
-    });
+    await this.db.query`
+      INSERT INTO refresh_tokens (id, token, user_id, expires_at)
+      VALUES (${randomUUID()}, ${token}, ${userId}, ${expiresAt})
+    `;
   }
 
   private calculateExpiration(expiresIn: string): Date {
@@ -205,9 +205,9 @@ export class AuthService {
     return {
       id: user.id,
       email: user.email,
-      firstName: user.firstName,
-      lastName: user.lastName,
-      fullName: `${user.firstName} ${user.lastName}`,
+      firstName: user.first_name || user.firstName,
+      lastName: user.last_name || user.lastName,
+      fullName: `${user.first_name || user.firstName} ${user.last_name || user.lastName}`,
     };
   }
 }
