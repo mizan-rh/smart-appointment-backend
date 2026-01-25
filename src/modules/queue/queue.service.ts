@@ -5,8 +5,9 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
+import { randomUUID } from 'crypto';
 import { formatDistanceToNow } from 'date-fns';
-import { PrismaService } from '../../database/prisma.service';
+import { DatabaseService } from '../../database/database.service';
 import { DURATION_MAP } from '../services/dto';
 import { ServicesService } from '../services/services.service';
 import { StaffService } from '../staff/staff.service';
@@ -16,50 +17,43 @@ export class QueueService {
   private readonly logger = new Logger(QueueService.name);
 
   constructor(
-    private prisma: PrismaService,
+    private db: DatabaseService,
     private staffService: StaffService,
     private servicesService: ServicesService,
   ) { }
 
   /* -------------------- GET QUEUE -------------------- */
   async getQueue(userId: string) {
-    const queueEntries = await this.prisma.queueEntry.findMany({
-      include: {
-        appointment: {
-          include: {
-            service: true,
-          },
-        },
-      },
-      orderBy: { queuePosition: 'asc' },
-    });
+    const queueEntries = await this.db.query`
+      SELECT q.*, 
+             a.customer_name as "customerName", a.appointment_date as "appointmentDate", 
+             a.appointment_time as "appointmentTime", a.service_id as "serviceId",
+             s.name as "serviceName", s.duration as "serviceDuration", s.required_staff_type as "requiredStaffType"
+      FROM queue_entries q
+      JOIN appointments a ON q.appointment_id = a.id
+      JOIN services s ON a.service_id = s.id
+      WHERE a.user_id = ${userId}
+      ORDER BY q.queue_position ASC
+    `;
 
-    // Filter by user
-    const userQueue = queueEntries.filter(
-      (q) => q.appointment.userId === userId,
-    );
-
-    return userQueue.map((q) => this.mapQueueEntryResponse(q));
+    return queueEntries.map((q: any) => this.mapQueueEntryResponse(q));
   }
 
   /* -------------------- MANUAL ASSIGN FROM QUEUE -------------------- */
   async assignFromQueue(userId: string, queueEntryId: string, staffId: string) {
-    const queueEntry = await this.prisma.queueEntry.findUnique({
-      where: { id: queueEntryId },
-      include: {
-        appointment: {
-          include: {
-            service: true,
-          },
-        },
-      },
-    });
+    const [queueEntry] = await this.db.query`
+      SELECT q.*, a.id as "appointmentId", a.user_id as "userId", a.service_id as "serviceId",
+             a.appointment_date as "appointmentDate", a.appointment_time as "appointmentTime"
+      FROM queue_entries q
+      JOIN appointments a ON q.appointment_id = a.id
+      WHERE q.id = ${queueEntryId}
+    `;
 
     if (!queueEntry) {
       throw new NotFoundException('Queue entry not found');
     }
 
-    const appointment = queueEntry.appointment;
+    const appointment = queueEntry;
 
     if (appointment.userId !== userId) {
       throw new BadRequestException('Unauthorized');
@@ -73,7 +67,7 @@ export class QueueService {
       userId,
       staffId,
       service.requiredStaffType,
-      appointment.appointmentDate,
+      new Date(appointment.appointmentDate),
       appointment.appointmentTime,
       duration,
     );
@@ -83,63 +77,51 @@ export class QueueService {
     }
 
     // Assign staff and remove from queue
-    const updated = await this.prisma.appointment.update({
-      where: { id: appointment.id },
-      data: {
-        staffId,
-        status: 'SCHEDULED',
-      },
-      include: {
-        staff: true,
-      },
-    });
+    await this.db.query`
+      UPDATE appointments 
+      SET staff_id = ${staffId}, status = 'SCHEDULED', updated_at = NOW()
+      WHERE id = ${appointment.appointmentId}
+    `;
 
     // Remove from queue
-    await this.prisma.queueEntry.delete({
-      where: { id: queueEntryId },
-    });
+    await this.db.query`DELETE FROM queue_entries WHERE id = ${queueEntryId}`;
 
     // Reorder remaining queue
     await this.reorderQueue();
 
     // Log activity
-    await this.prisma.activityLog.create({
-      data: {
-        userId,
-        actionType: 'QUEUE_ASSIGNED',
-        description: `Appointment for "${appointment.customerName}" assigned to ${updated.staff?.name} from queue`,
-        appointmentId: appointment.id,
-        staffId,
-      },
-    });
+    await this.db.query`
+      INSERT INTO activity_logs (id, user_id, action_type, description, appointment_id, staff_id)
+      VALUES (${randomUUID()}, ${userId}, 'QUEUE_ASSIGNED', ${`Appointment assigned from queue`}, ${appointment.appointmentId}, ${staffId})
+    `;
 
     this.logger.log(
       `Queue entry ${queueEntryId} assigned to staff ${staffId}`,
     );
 
+    const [result] = await this.db.query`
+      SELECT a.* FROM appointments a WHERE a.id = ${appointment.appointmentId}
+    `;
+
     return {
       message: 'Appointment assigned successfully',
-      appointment: updated,
+      appointment: result,
     };
   }
 
   /* -------------------- AUTO-ASSIGN ALL (CRON + MANUAL) -------------------- */
   async autoAssignAll(userId: string) {
-    const queueEntries = await this.prisma.queueEntry.findMany({
-      include: {
-        appointment: {
-          include: {
-            service: true,
-          },
-        },
-      },
-      orderBy: { queuePosition: 'asc' },
-    });
-
-    // Filter by user
-    const userQueue = queueEntries.filter(
-      (q) => q.appointment.userId === userId,
-    );
+    const userQueue = await this.db.query`
+      SELECT q.*, a.id as "appointmentId", a.customer_name as "customerName",
+             a.appointment_date as "appointmentDate", a.appointment_time as "appointmentTime",
+             a.service_id as "serviceId",
+             s.required_staff_type as "requiredStaffType", s.duration as "serviceDuration"
+      FROM queue_entries q
+      JOIN appointments a ON q.appointment_id = a.id
+      JOIN services s ON a.service_id = s.id
+      WHERE a.user_id = ${userId}
+      ORDER BY q.queue_position ASC
+    `;
 
     const results: Array<{
       appointmentId: string;
@@ -152,16 +134,14 @@ export class QueueService {
     let failed = 0;
 
     for (const queueEntry of userQueue) {
-      const appointment = queueEntry.appointment;
-      const service = await this.servicesService.findOne(userId, appointment.serviceId);
-      const duration = DURATION_MAP[service.duration];
+      const duration = DURATION_MAP[queueEntry.serviceDuration as keyof typeof DURATION_MAP];
 
       // Find available staff
       const availableStaff = await this.staffService.getAvailableStaff(
         userId,
-        service.requiredStaffType,
-        appointment.appointmentDate,
-        appointment.appointmentTime,
+        queueEntry.requiredStaffType,
+        new Date(queueEntry.appointmentDate),
+        queueEntry.appointmentTime,
         duration,
       );
 
@@ -170,45 +150,36 @@ export class QueueService {
       if (eligibleStaff) {
         try {
           // Assign to first available staff
-          await this.prisma.appointment.update({
-            where: { id: appointment.id },
-            data: {
-              staffId: eligibleStaff.id,
-              status: 'SCHEDULED',
-            },
-          });
+          await this.db.query`
+            UPDATE appointments 
+            SET staff_id = ${eligibleStaff.id}, status = 'SCHEDULED', updated_at = NOW()
+            WHERE id = ${queueEntry.appointmentId}
+          `;
 
           // Remove from queue
-          await this.prisma.queueEntry.delete({
-            where: { id: queueEntry.id },
-          });
+          await this.db.query`DELETE FROM queue_entries WHERE id = ${queueEntry.id}`;
 
           // Log activity
-          await this.prisma.activityLog.create({
-            data: {
-              userId,
-              actionType: 'QUEUE_ASSIGNED',
-              description: `Appointment for "${appointment.customerName}" auto-assigned to ${eligibleStaff.name}`,
-              appointmentId: appointment.id,
-              staffId: eligibleStaff.id,
-            },
-          });
+          await this.db.query`
+            INSERT INTO activity_logs (id, user_id, action_type, description, appointment_id, staff_id)
+            VALUES (${randomUUID()}, ${userId}, 'QUEUE_ASSIGNED', ${`Appointment for "${queueEntry.customerName}" auto-assigned to ${eligibleStaff.name}`}, ${queueEntry.appointmentId}, ${eligibleStaff.id})
+          `;
 
           results.push({
-            appointmentId: appointment.id,
-            customerName: appointment.customerName,
+            appointmentId: queueEntry.appointmentId,
+            customerName: queueEntry.customerName,
             success: true,
             staffAssigned: eligibleStaff.name,
           });
 
           assigned++;
           this.logger.log(
-            `Auto-assigned: ${appointment.customerName} → ${eligibleStaff.name}`,
+            `Auto-assigned: ${queueEntry.customerName} → ${eligibleStaff.name}`,
           );
         } catch (error) {
           results.push({
-            appointmentId: appointment.id,
-            customerName: appointment.customerName,
+            appointmentId: queueEntry.appointmentId,
+            customerName: queueEntry.customerName,
             success: false,
             reason: 'Assignment failed',
           });
@@ -216,8 +187,8 @@ export class QueueService {
         }
       } else {
         results.push({
-          appointmentId: appointment.id,
-          customerName: appointment.customerName,
+          appointmentId: queueEntry.appointmentId,
+          customerName: queueEntry.customerName,
           success: false,
           reason: 'No available staff',
         });
@@ -246,15 +217,13 @@ export class QueueService {
 
     try {
       // Get all users with queue entries
-      const queueEntries = await this.prisma.queueEntry.findMany({
-        include: {
-          appointment: true,
-        },
-      });
+      const userIds = await this.db.query`
+        SELECT DISTINCT a.user_id as "userId"
+        FROM queue_entries q
+        JOIN appointments a ON q.appointment_id = a.id
+      `;
 
-      const userIds = [...new Set(queueEntries.map((q) => q.appointment.userId))];
-
-      for (const userId of userIds) {
+      for (const { userId } of userIds) {
         await this.autoAssignAll(userId);
       }
 
@@ -310,40 +279,39 @@ export class QueueService {
 
   /* -------------------- REORDER QUEUE -------------------- */
   private async reorderQueue() {
-    const queueEntries = await this.prisma.queueEntry.findMany({
-      orderBy: { addedAt: 'asc' },
-    });
+    const queueEntries = await this.db.query`
+      SELECT id FROM queue_entries ORDER BY added_at ASC
+    `;
 
     for (let i = 0; i < queueEntries.length; i++) {
-      await this.prisma.queueEntry.update({
-        where: { id: queueEntries[i].id },
-        data: { queuePosition: i + 1 },
-      });
+      await this.db.query`
+        UPDATE queue_entries SET queue_position = ${i + 1} WHERE id = ${queueEntries[i].id}
+      `;
     }
   }
 
   /* -------------------- MAP QUEUE ENTRY RESPONSE -------------------- */
   private mapQueueEntryResponse(queueEntry: any) {
-    const waitingTime = formatDistanceToNow(queueEntry.addedAt, {
+    const waitingTime = formatDistanceToNow(new Date(queueEntry.added_at || queueEntry.addedAt), {
       addSuffix: true,
     });
 
     return {
       id: queueEntry.id,
-      queuePosition: queueEntry.queuePosition,
+      queuePosition: queueEntry.queue_position || queueEntry.queuePosition,
       appointment: {
-        id: queueEntry.appointment.id,
-        customerName: queueEntry.appointment.customerName,
+        id: queueEntry.appointment_id || queueEntry.appointmentId,
+        customerName: queueEntry.customerName,
         service: {
-          id: queueEntry.appointment.service.id,
-          name: queueEntry.appointment.service.name,
-          duration: DURATION_MAP[queueEntry.appointment.service.duration],
-          requiredStaffType: queueEntry.appointment.service.requiredStaffType,
+          id: queueEntry.serviceId,
+          name: queueEntry.serviceName,
+          duration: DURATION_MAP[queueEntry.serviceDuration as keyof typeof DURATION_MAP],
+          requiredStaffType: queueEntry.requiredStaffType,
         },
-        appointmentDate: queueEntry.appointment.appointmentDate,
-        appointmentTime: queueEntry.appointment.appointmentTime,
+        appointmentDate: queueEntry.appointmentDate,
+        appointmentTime: queueEntry.appointmentTime,
       },
-      addedAt: queueEntry.addedAt,
+      addedAt: queueEntry.added_at || queueEntry.addedAt,
       waitingTime,
     };
   }

@@ -1,24 +1,25 @@
 import {
-  Injectable,
-  NotFoundException,
   BadRequestException,
+  Injectable,
   Logger,
+  NotFoundException,
 } from '@nestjs/common';
-import { PrismaService } from '../../database/prisma.service';
-import { StaffService } from '../staff/staff.service';
-import { ServicesService } from '../services/services.service';
-import { CreateAppointmentDto, UpdateAppointmentDto } from './dto';
+import { randomUUID } from 'crypto';
+import { DatabaseService } from '../../database/database.service';
 import { DURATION_MAP } from '../services/dto';
+import { ServicesService } from '../services/services.service';
+import { StaffService } from '../staff/staff.service';
+import { CreateAppointmentDto, UpdateAppointmentDto } from './dto';
 
 @Injectable()
 export class AppointmentsService {
   private readonly logger = new Logger(AppointmentsService.name);
 
   constructor(
-    private prisma: PrismaService,
+    private db: DatabaseService,
     private staffService: StaffService,
     private servicesService: ServicesService,
-  ) {}
+  ) { }
 
   /* -------------------- CREATE APPOINTMENT -------------------- */
   async create(userId: string, dto: CreateAppointmentDto) {
@@ -42,37 +43,34 @@ export class AppointmentsService {
       }
 
       // Create appointment with staff
-      const appointment = await this.prisma.appointment.create({
-        data: {
-          userId,
-          customerName: dto.customerName,
-          serviceId: dto.serviceId,
-          staffId: dto.staffId,
-          appointmentDate: dto.appointmentDate,
-          appointmentTime: dto.appointmentTime,
-          duration,
-          status: 'SCHEDULED',
-        },
-        include: {
-          service: true,
-          staff: true,
-        },
-      });
+      const appointmentId = randomUUID();
+      await this.db.query`
+        INSERT INTO appointments (id, user_id, customer_name, service_id, staff_id, appointment_date, appointment_time, duration, status, updated_at)
+        VALUES (
+          ${appointmentId}, 
+          ${userId}, 
+          ${dto.customerName}, 
+          ${dto.serviceId}, 
+          ${dto.staffId}, 
+          ${dto.appointmentDate.toISOString().split('T')[0]}, 
+          ${dto.appointmentTime}, 
+          ${duration}, 
+          'SCHEDULED', 
+          NOW()
+        )
+      `;
+
+      const appointment = await this.findOne(userId, appointmentId);
 
       // Log activity
-      await this.prisma.activityLog.create({
-        data: {
-          userId,
-          actionType: 'APPOINTMENT_ASSIGNED',
-          description: `Appointment for "${dto.customerName}" assigned to ${appointment.staff?.name}`,
-          appointmentId: appointment.id,
-          staffId: dto.staffId,
-        },
-      });
+      await this.db.query`
+        INSERT INTO activity_logs (id, user_id, action_type, description, appointment_id, staff_id)
+        VALUES (${randomUUID()}, ${userId}, 'APPOINTMENT_ASSIGNED', ${`Appointment for "${dto.customerName}" assigned to ${appointment.staff?.name}`}, ${appointment.id}, ${dto.staffId})
+      `;
 
       this.logger.log(`Appointment created and assigned: ${appointment.id}`);
 
-      return this.mapAppointmentResponse(appointment);
+      return appointment;
     }
 
     // No staff assigned - check if we should queue it
@@ -88,44 +86,41 @@ export class AppointmentsService {
 
     if (!hasAvailableStaff) {
       // Add to queue
-      const appointment = await this.prisma.appointment.create({
-        data: {
-          userId,
-          customerName: dto.customerName,
-          serviceId: dto.serviceId,
-          appointmentDate: dto.appointmentDate,
-          appointmentTime: dto.appointmentTime,
-          duration,
-          status: 'IN_QUEUE',
-        },
-        include: {
-          service: true,
-        },
-      });
+      const appointmentId = randomUUID();
+      await this.db.query`
+        INSERT INTO appointments (id, user_id, customer_name, service_id, appointment_date, appointment_time, duration, status, updated_at)
+        VALUES (
+          ${appointmentId}, 
+          ${userId}, 
+          ${dto.customerName}, 
+          ${dto.serviceId}, 
+          ${dto.appointmentDate.toISOString().split('T')[0]}, 
+          ${dto.appointmentTime}, 
+          ${duration}, 
+          'IN_QUEUE', 
+          NOW()
+        )
+      `;
 
       // Get next queue position
-      const queueCount = await this.prisma.queueEntry.count();
+      const [{ count }] = await this.db.query`SELECT COUNT(*)::int as count FROM queue_entries`;
 
-      await this.prisma.queueEntry.create({
-        data: {
-          appointmentId: appointment.id,
-          queuePosition: queueCount + 1,
-        },
-      });
+      await this.db.query`
+        INSERT INTO queue_entries (id, appointment_id, queue_position)
+        VALUES (${randomUUID()}, ${appointmentId}, ${count + 1})
+      `;
+
+      const appointment = await this.findOne(userId, appointmentId);
 
       // Log activity
-      await this.prisma.activityLog.create({
-        data: {
-          userId,
-          actionType: 'QUEUE_ADDED',
-          description: `Appointment for "${dto.customerName}" added to waiting queue`,
-          appointmentId: appointment.id,
-        },
-      });
+      await this.db.query`
+        INSERT INTO activity_logs (id, user_id, action_type, description, appointment_id)
+        VALUES (${randomUUID()}, ${userId}, 'QUEUE_ADDED', ${`Appointment for "${dto.customerName}" added to waiting queue`}, ${appointment.id})
+      `;
 
       this.logger.log(`Appointment added to queue: ${appointment.id}`);
 
-      return this.mapAppointmentResponse(appointment);
+      return appointment;
     }
 
     // Has available staff but user didn't select - return error with suggestions
@@ -199,39 +194,49 @@ export class AppointmentsService {
 
   /* -------------------- GET ALL APPOINTMENTS -------------------- */
   async findAll(userId: string, date?: Date, staffId?: string) {
-    const where: any = { userId };
+    const params: any[] = [userId];
+    let query = `
+      SELECT a.*, 
+             s.name as "serviceName", s.duration as "serviceDuration",
+             st.name as "staffName", st.service_type as "staffServiceType",
+             q.queue_position as "queuePosition"
+      FROM appointments a
+      LEFT JOIN services s ON a.service_id = s.id
+      LEFT JOIN staff st ON a.staff_id = st.id
+      LEFT JOIN queue_entries q ON a.id = q.appointment_id
+      WHERE a.user_id = $1
+    `;
 
     if (date) {
-      where.appointmentDate = date;
+      params.push(date.toISOString().split('T')[0]);
+      query += ` AND a.appointment_date = $${params.length}`;
     }
 
     if (staffId) {
-      where.staffId = staffId;
+      params.push(staffId);
+      query += ` AND a.staff_id = $${params.length}`;
     }
 
-    const appointments = await this.prisma.appointment.findMany({
-      where,
-      include: {
-        service: true,
-        staff: true,
-        queue: true,
-      },
-      orderBy: [{ appointmentDate: 'asc' }, { appointmentTime: 'asc' }],
-    });
+    query += ` ORDER BY a.appointment_date ASC, a.appointment_time ASC`;
 
-    return appointments.map((a) => this.mapAppointmentResponse(a));
+    const appointments = await this.db.raw(query, params);
+
+    return appointments.map((a: any) => this.mapAppointmentResponse(a));
   }
 
   /* -------------------- GET APPOINTMENT BY ID -------------------- */
   async findOne(userId: string, appointmentId: string) {
-    const appointment = await this.prisma.appointment.findFirst({
-      where: { id: appointmentId, userId },
-      include: {
-        service: true,
-        staff: true,
-        queue: true,
-      },
-    });
+    const [appointment] = await this.db.query`
+      SELECT a.*, 
+             s.name as "serviceName", s.duration as "serviceDuration",
+             st.name as "staffName", st.service_type as "staffServiceType",
+             q.queue_position as "queuePosition"
+      FROM appointments a
+      LEFT JOIN services s ON a.service_id = s.id
+      LEFT JOIN staff st ON a.staff_id = st.id
+      LEFT JOIN queue_entries q ON a.id = q.appointment_id
+      WHERE a.id = ${appointmentId} AND a.user_id = ${userId}
+    `;
 
     if (!appointment) {
       throw new NotFoundException('Appointment not found');
@@ -250,7 +255,7 @@ export class AppointmentsService {
         userId,
         dto.serviceId || existing.service.id,
       );
-      const duration = DURATION_MAP[service.duration];
+      const duration = DURATION_MAP[service.duration as keyof typeof DURATION_MAP] || existing.duration;
 
       if (dto.staffId) {
         const validationResult = await this.validateStaffAssignment(
@@ -268,60 +273,51 @@ export class AppointmentsService {
       }
     }
 
-    const updated = await this.prisma.appointment.update({
-      where: { id: appointmentId },
-      data: dto,
-      include: {
-        service: true,
-        staff: true,
-        queue: true,
-      },
-    });
+    const [updated] = await this.db.query`
+      UPDATE appointments
+      SET customer_name = COALESCE(${dto.customerName}, customer_name),
+          service_id = COALESCE(${dto.serviceId}, service_id),
+          staff_id = COALESCE(${dto.staffId}, staff_id),
+          appointment_date = COALESCE(${dto.appointmentDate ? dto.appointmentDate.toISOString().split('T')[0] : null}, appointment_date),
+          appointment_time = COALESCE(${dto.appointmentTime}, appointment_time),
+          status = COALESCE(${dto.status}, status),
+          updated_at = NOW()
+      WHERE id = ${appointmentId}
+      RETURNING *
+    `;
 
     // Log activity
-    await this.prisma.activityLog.create({
-      data: {
-        userId,
-        actionType: 'APPOINTMENT_UPDATED',
-        description: `Appointment for "${updated.customerName}" updated`,
-        appointmentId: updated.id,
-        staffId: updated.staffId,
-      },
-    });
+    await this.db.query`
+      INSERT INTO activity_logs (id, user_id, action_type, description, appointment_id, staff_id)
+      VALUES (${randomUUID()}, ${userId}, 'APPOINTMENT_UPDATED', ${`Appointment for "${updated.customer_name}" updated`}, ${updated.id}, ${updated.staff_id})
+    `;
 
     this.logger.log(`Appointment updated: ${appointmentId}`);
 
-    return this.mapAppointmentResponse(updated);
+    return this.findOne(userId, appointmentId);
   }
 
   /* -------------------- CANCEL APPOINTMENT -------------------- */
   async cancel(userId: string, appointmentId: string) {
     const appointment = await this.findOne(userId, appointmentId);
 
-    await this.prisma.appointment.update({
-      where: { id: appointmentId },
-      data: { status: 'CANCELLED' },
-    });
+    await this.db.query`
+      UPDATE appointments SET status = 'CANCELLED', updated_at = NOW() WHERE id = ${appointmentId}
+    `;
 
     // If in queue, remove from queue
     if (appointment.inQueue) {
-      await this.prisma.queueEntry.delete({
-        where: { appointmentId },
-      });
+      await this.db.query`DELETE FROM queue_entries WHERE appointment_id = ${appointmentId}`;
 
       // Reorder queue
       await this.reorderQueue();
     }
 
     // Log activity
-    await this.prisma.activityLog.create({
-      data: {
-        userId,
-        actionType: 'APPOINTMENT_CANCELLED',
-        description: `Appointment for "${appointment.customerName}" cancelled`,
-        appointmentId,
-      },
-    });
+    await this.db.query`
+      INSERT INTO activity_logs (id, user_id, action_type, description, appointment_id)
+      VALUES (${randomUUID()}, ${userId}, 'APPOINTMENT_CANCELLED', ${`Appointment for "${appointment.customerName}" cancelled`}, ${appointmentId})
+    `;
 
     this.logger.log(`Appointment cancelled: ${appointmentId}`);
 
@@ -330,15 +326,14 @@ export class AppointmentsService {
 
   /* -------------------- HELPER: REORDER QUEUE -------------------- */
   private async reorderQueue() {
-    const queueEntries = await this.prisma.queueEntry.findMany({
-      orderBy: { addedAt: 'asc' },
-    });
+    const queueEntries = await this.db.query`
+      SELECT id FROM queue_entries ORDER BY added_at ASC
+    `;
 
     for (let i = 0; i < queueEntries.length; i++) {
-      await this.prisma.queueEntry.update({
-        where: { id: queueEntries[i].id },
-        data: { queuePosition: i + 1 },
-      });
+      await this.db.query`
+        UPDATE queue_entries SET queue_position = ${i + 1} WHERE id = ${queueEntries[i].id}
+      `;
     }
   }
 
@@ -346,26 +341,26 @@ export class AppointmentsService {
   private mapAppointmentResponse(appointment: any) {
     return {
       id: appointment.id,
-      customerName: appointment.customerName,
+      customerName: appointment.customer_name || appointment.customerName,
       service: {
-        id: appointment.service.id,
-        name: appointment.service.name,
-        duration: DURATION_MAP[appointment.service.duration],
+        id: appointment.service_id || appointment.serviceId,
+        name: appointment.serviceName,
+        duration: appointment.serviceDuration,
       },
-      staff: appointment.staff
+      staff: (appointment.staff_id || appointment.staffId)
         ? {
-            id: appointment.staff.id,
-            name: appointment.staff.name,
-            serviceType: appointment.staff.serviceType,
-          }
+          id: appointment.staff_id || appointment.staffId,
+          name: appointment.staffName,
+          serviceType: appointment.staffServiceType,
+        }
         : undefined,
-      appointmentDate: appointment.appointmentDate,
-      appointmentTime: appointment.appointmentTime,
+      appointmentDate: appointment.appointment_date || appointment.appointmentDate,
+      appointmentTime: appointment.appointment_time || appointment.appointmentTime,
       duration: appointment.duration,
       status: appointment.status,
-      inQueue: !!appointment.queue,
-      queuePosition: appointment.queue?.queuePosition,
-      createdAt: appointment.createdAt,
+      inQueue: !!appointment.queuePosition,
+      queuePosition: appointment.queuePosition,
+      createdAt: appointment.created_at || appointment.createdAt,
     };
   }
 }

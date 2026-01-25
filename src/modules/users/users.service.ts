@@ -1,21 +1,16 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { PrismaService } from '../../database/prisma.service';
+import { DatabaseService } from '../../database/database.service';
 
 @Injectable()
 export class UsersService {
-  constructor(private prisma: PrismaService) {}
+  constructor(private db: DatabaseService) { }
 
   async findById(id: string) {
-    const user = await this.prisma.user.findUnique({
-      where: { id },
-      select: {
-        id: true,
-        email: true,
-        firstName: true,
-        lastName: true,
-        createdAt: true,
-      },
-    });
+    const [user] = await this.db.query`
+      SELECT id, email, first_name as "firstName", last_name as "lastName", created_at as "createdAt"
+      FROM users
+      WHERE id = ${id}
+    `;
 
     if (!user) {
       throw new NotFoundException('User not found');
@@ -28,15 +23,11 @@ export class UsersService {
   }
 
   async findByEmail(email: string) {
-    return this.prisma.user.findUnique({
-      where: { email },
-      select: {
-        id: true,
-        email: true,
-        firstName: true,
-        lastName: true,
-        password: true,
-      },
-    });
+    const [user] = await this.db.query`
+      SELECT id, email, first_name as "firstName", last_name as "lastName", password
+      FROM users
+      WHERE email = ${email}
+    `;
+    return user;
   }
 }

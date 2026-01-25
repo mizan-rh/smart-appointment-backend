@@ -9,7 +9,6 @@ import { JwtService, JwtSignOptions } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
 import { randomUUID } from 'crypto';
 import { DatabaseService } from '../../database/database.service';
-import { PrismaService } from '../../database/prisma.service';
 import { AuthResponseDto, LoginDto, SignupDto } from './dto';
 
 @Injectable()
@@ -17,7 +16,6 @@ export class AuthService {
   private readonly logger = new Logger(AuthService.name);
 
   constructor(
-    private prisma: PrismaService,
     private db: DatabaseService,
     private jwtService: JwtService,
     private configService: ConfigService,

@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { endOfDay, endOfWeek, formatDistanceToNow, startOfDay, startOfWeek } from 'date-fns';
-import { PrismaService } from '../../database/prisma.service';
+import { endOfWeek, formatDistanceToNow, startOfDay, startOfWeek } from 'date-fns';
+import { DatabaseService } from '../../database/database.service';
 import { StaffService } from '../staff/staff.service';
 
 @Injectable()
@@ -8,65 +8,43 @@ export class DashboardService {
     private readonly logger = new Logger(DashboardService.name);
 
     constructor(
-        private prisma: PrismaService,
+        private db: DatabaseService,
         private staffService: StaffService,
     ) { }
 
     /* -------------------- GET DASHBOARD METRICS -------------------- */
     async getDashboardMetrics(userId: string, date?: Date) {
         const targetDate = date || new Date();
-        const startDate = startOfDay(targetDate);
-        const endDate = endOfDay(targetDate);
+        const dateStr = targetDate.toISOString().split('T')[0];
 
         // Appointments metrics
-        const [totalToday, completed, pending, cancelled, noShow] = await Promise.all([
-            this.prisma.appointment.count({
-                where: {
-                    userId,
-                    appointmentDate: targetDate,
-                },
-            }),
-            this.prisma.appointment.count({
-                where: {
-                    userId,
-                    appointmentDate: targetDate,
-                    status: 'COMPLETED',
-                },
-            }),
-            this.prisma.appointment.count({
-                where: {
-                    userId,
-                    appointmentDate: targetDate,
-                    status: 'SCHEDULED',
-                },
-            }),
-            this.prisma.appointment.count({
-                where: {
-                    userId,
-                    appointmentDate: targetDate,
-                    status: 'CANCELLED',
-                },
-            }),
-            this.prisma.appointment.count({
-                where: {
-                    userId,
-                    appointmentDate: targetDate,
-                    status: 'NO_SHOW',
-                },
-            }),
-        ]);
+        const [counts] = await this.db.query`
+            SELECT 
+                COUNT(*)::int as total,
+                COUNT(*) FILTER (WHERE status = 'COMPLETED')::int as completed,
+                COUNT(*) FILTER (WHERE status = 'SCHEDULED')::int as pending,
+                COUNT(*) FILTER (WHERE status = 'CANCELLED')::int as cancelled,
+                COUNT(*) FILTER (WHERE status = 'NO_SHOW')::int as no_show
+            FROM appointments
+            WHERE user_id = ${userId} AND appointment_date = ${dateStr}
+        `;
+
+        const totalToday = counts.total;
+        const completed = counts.completed;
+        const pending = counts.pending;
+        const cancelled = counts.cancelled;
+        const noShow = counts.no_show;
 
         const completionRate = totalToday > 0 ? (completed / totalToday) * 100 : 0;
 
         // Queue metrics
-        const queueEntries = await this.prisma.queueEntry.findMany({
-            include: {
-                appointment: true,
-            },
-            orderBy: { addedAt: 'asc' },
-        });
-
-        const userQueue = queueEntries.filter((q) => q.appointment.userId === userId);
+        const userQueue = await this.db.query`
+            SELECT q.*, a.user_id
+            FROM queue_entries q
+            JOIN appointments a ON q.appointment_id = a.id
+            WHERE a.user_id = ${userId}
+            ORDER BY q.added_at ASC
+        `;
         const totalInQueue = userQueue.length;
 
         let oldestWaitTime = 'N/A';
@@ -74,10 +52,10 @@ export class DashboardService {
 
         if (totalInQueue > 0) {
             const oldestEntry = userQueue[0];
-            oldestWaitTime = formatDistanceToNow(oldestEntry.addedAt);
+            oldestWaitTime = formatDistanceToNow(new Date(oldestEntry.added_at));
 
-            const totalWaitMinutes = userQueue.reduce((sum, q) => {
-                const waitTime = Date.now() - q.addedAt.getTime();
+            const totalWaitMinutes = userQueue.reduce((sum: number, q: any) => {
+                const waitTime = Date.now() - new Date(q.added_at).getTime();
                 return sum + waitTime / 1000 / 60;
             }, 0);
 
@@ -86,21 +64,21 @@ export class DashboardService {
         }
 
         // Staff metrics
-        const allStaff = await this.prisma.staff.findMany({
-            where: { userId },
-        });
+        const allStaff = await this.db.query`
+            SELECT * FROM staff WHERE user_id = ${userId}
+        `;
 
         const totalStaff = allStaff.length;
         const available = allStaff.filter((s) => s.status === 'AVAILABLE').length;
         const onLeave = allStaff.filter((s) => s.status === 'ON_LEAVE').length;
 
         const loadSummary = await Promise.all(
-            allStaff.map(async (staff) => {
+            allStaff.map(async (staff: any) => {
                 const currentLoad = await this.staffService.getStaffLoadForDate(
                     staff.id,
                     targetDate,
                 );
-                const percentage = (currentLoad / staff.dailyCapacity) * 100;
+                const percentage = (currentLoad / (staff.daily_capacity || staff.dailyCapacity)) * 100;
 
                 let status: 'OK' | 'BUSY' | 'FULL' | 'OVERBOOKED';
                 if (currentLoad > staff.dailyCapacity) {
@@ -117,7 +95,7 @@ export class DashboardService {
                     id: staff.id,
                     name: staff.name,
                     currentLoad,
-                    capacity: staff.dailyCapacity,
+                    capacity: staff.daily_capacity || staff.dailyCapacity,
                     percentage: Math.round(percentage),
                     status,
                 };
@@ -125,17 +103,18 @@ export class DashboardService {
         );
 
         // Recent activity (last 5)
-        const recentActivity = await this.prisma.activityLog.findMany({
-            where: { userId },
-            orderBy: { createdAt: 'desc' },
-            take: 5,
-        });
+        const recentActivity = await this.db.query`
+            SELECT * FROM activity_logs 
+            WHERE user_id = ${userId}
+            ORDER BY created_at DESC
+            LIMIT 5
+        `;
 
-        const recentActivityMapped = recentActivity.map((log) => ({
+        const recentActivityMapped = recentActivity.map((log: any) => ({
             id: log.id,
             description: log.description,
-            timestamp: log.createdAt,
-            timeAgo: formatDistanceToNow(log.createdAt, { addSuffix: true }),
+            timestamp: log.created_at || log.createdAt,
+            timeAgo: formatDistanceToNow(new Date(log.created_at || log.createdAt), { addSuffix: true }),
         }));
 
         return {
@@ -164,56 +143,32 @@ export class DashboardService {
 
     /* -------------------- GET APPOINTMENT STATISTICS -------------------- */
     async getAppointmentStats(userId: string, startDate?: Date, endDate?: Date) {
-        const start = startDate || startOfWeek(new Date());
-        const end = endDate || endOfWeek(new Date());
+        const start = (startDate || startOfWeek(new Date())).toISOString().split('T')[0];
+        const end = (endDate || endOfWeek(new Date())).toISOString().split('T')[0];
 
-        // Total appointments
-        const total = await this.prisma.appointment.count({
-            where: {
-                userId,
-                appointmentDate: {
-                    gte: start,
-                    lte: end,
-                },
-            },
-        });
-
-        // By status
-        const [scheduled, completed, cancelled, noShow, inQueue] = await Promise.all([
-            this.prisma.appointment.count({
-                where: { userId, status: 'SCHEDULED', appointmentDate: { gte: start, lte: end } },
-            }),
-            this.prisma.appointment.count({
-                where: { userId, status: 'COMPLETED', appointmentDate: { gte: start, lte: end } },
-            }),
-            this.prisma.appointment.count({
-                where: { userId, status: 'CANCELLED', appointmentDate: { gte: start, lte: end } },
-            }),
-            this.prisma.appointment.count({
-                where: { userId, status: 'NO_SHOW', appointmentDate: { gte: start, lte: end } },
-            }),
-            this.prisma.appointment.count({
-                where: { userId, status: 'IN_QUEUE' },
-            }),
-        ]);
+        // Total and by status
+        const [counts] = await this.db.query`
+            SELECT 
+                COUNT(*)::int as total,
+                COUNT(*) FILTER (WHERE status = 'SCHEDULED' AND appointment_date >= ${start} AND appointment_date <= ${end})::int as scheduled,
+                COUNT(*) FILTER (WHERE status = 'COMPLETED' AND appointment_date >= ${start} AND appointment_date <= ${end})::int as completed,
+                COUNT(*) FILTER (WHERE status = 'CANCELLED' AND appointment_date >= ${start} AND appointment_date <= ${end})::int as cancelled,
+                COUNT(*) FILTER (WHERE status = 'NO_SHOW' AND appointment_date >= ${start} AND appointment_date <= ${end})::int as no_show,
+                COUNT(*) FILTER (WHERE status = 'IN_QUEUE')::int as in_queue
+            FROM appointments
+            WHERE user_id = ${userId}
+        `;
 
         // By date (daily breakdown)
-        const appointments = await this.prisma.appointment.findMany({
-            where: {
-                userId,
-                appointmentDate: {
-                    gte: start,
-                    lte: end,
-                },
-            },
-            select: {
-                appointmentDate: true,
-            },
-        });
+        const appointments = await this.db.query`
+            SELECT appointment_date as "appointmentDate"
+            FROM appointments
+            WHERE user_id = ${userId} AND appointment_date >= ${start} AND appointment_date <= ${end}
+        `;
 
-        const byDateMap = appointments.reduce((acc, appt) => {
-            const dateKey = appt.appointmentDate.toISOString().split('T')[0];
-            acc[dateKey] = (acc[dateKey] || 0) + 1;
+        const byDateMap = appointments.reduce((acc: Record<string, number>, appt: any) => {
+            const dateStr = new Date(appt.appointmentDate).toISOString().split('T')[0];
+            acc[dateStr] = (acc[dateStr] || 0) + 1;
             return acc;
         }, {} as Record<string, number>);
 
@@ -223,67 +178,53 @@ export class DashboardService {
         }));
 
         // Upcoming
-        const today = startOfDay(new Date());
-        const upcomingToday = await this.prisma.appointment.count({
-            where: {
-                userId,
-                appointmentDate: today,
-                status: 'SCHEDULED',
-            },
-        });
+        const today = startOfDay(new Date()).toISOString().split('T')[0];
+        const weekEnd = endOfWeek(new Date()).toISOString().split('T')[0];
 
-        const upcomingThisWeek = await this.prisma.appointment.count({
-            where: {
-                userId,
-                appointmentDate: {
-                    gte: today,
-                    lte: endOfWeek(new Date()),
-                },
-                status: 'SCHEDULED',
-            },
-        });
+        const [upcoming] = await this.db.query`
+            SELECT 
+                COUNT(*) FILTER (WHERE appointment_date = ${today} AND status = 'SCHEDULED')::int as today,
+                COUNT(*) FILTER (WHERE appointment_date >= ${today} AND appointment_date <= ${weekEnd} AND status = 'SCHEDULED')::int as week
+            FROM appointments
+            WHERE user_id = ${userId}
+        `;
 
         return {
-            total,
+            total: counts.total,
             byStatus: {
-                scheduled,
-                completed,
-                cancelled,
-                noShow,
-                inQueue,
+                scheduled: counts.scheduled,
+                completed: counts.completed,
+                cancelled: counts.cancelled,
+                noShow: counts.no_show,
+                inQueue: counts.in_queue,
             },
             byDate,
-            upcomingToday,
-            upcomingThisWeek,
+            upcomingToday: upcoming.today,
+            upcomingThisWeek: upcoming.week,
         };
     }
 
     /* -------------------- GET STAFF PERFORMANCE -------------------- */
     async getStaffPerformance(userId: string, staffId?: string) {
-        const staffFilter = staffId ? { id: staffId, userId } : { userId };
-
-        const staff = await this.prisma.staff.findMany({
-            where: staffFilter,
-        });
+        const staff = await this.db.query`
+            SELECT id, name, daily_capacity as "dailyCapacity" 
+            FROM staff 
+            WHERE user_id = ${userId} ${staffId ? this.db.raw`AND id = ${staffId}` : this.db.raw``}
+        `;
 
         const performance = await Promise.all(
-            staff.map(async (s) => {
-                const [total, completed, cancelled, noShow] = await Promise.all([
-                    this.prisma.appointment.count({
-                        where: { staffId: s.id },
-                    }),
-                    this.prisma.appointment.count({
-                        where: { staffId: s.id, status: 'COMPLETED' },
-                    }),
-                    this.prisma.appointment.count({
-                        where: { staffId: s.id, status: 'CANCELLED' },
-                    }),
-                    this.prisma.appointment.count({
-                        where: { staffId: s.id, status: 'NO_SHOW' },
-                    }),
-                ]);
+            staff.map(async (s: any) => {
+                const [counts] = await this.db.query`
+                    SELECT 
+                        COUNT(*)::int as total,
+                        COUNT(*) FILTER (WHERE status = 'COMPLETED')::int as completed,
+                        COUNT(*) FILTER (WHERE status = 'CANCELLED')::int as cancelled,
+                        COUNT(*) FILTER (WHERE status = 'NO_SHOW')::int as no_show
+                    FROM appointments
+                    WHERE staff_id = ${s.id}
+                `;
 
-                const completionRate = total > 0 ? (completed / total) * 100 : 0;
+                const completionRate = counts.total > 0 ? (counts.completed / counts.total) * 100 : 0;
 
                 // Average load over last 7 days
                 const last7Days = Array.from({ length: 7 }, (_, i) => {
@@ -304,10 +245,10 @@ export class DashboardService {
                 return {
                     staffId: s.id,
                     staffName: s.name,
-                    totalAppointments: total,
-                    completedAppointments: completed,
-                    cancelledAppointments: cancelled,
-                    noShowAppointments: noShow,
+                    totalAppointments: counts.total,
+                    completedAppointments: counts.completed,
+                    cancelledAppointments: counts.cancelled,
+                    noShowAppointments: counts.no_show,
                     completionRate: Math.round(completionRate),
                     averageLoadPercentage: Math.round(avgLoadPercentage),
                 };
